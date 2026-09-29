@@ -36,6 +36,9 @@ Serato の履歴セッションを読む serato_nowplaying.py（TD の外で動�
 - **curl noise（ポテンシャルの回転）で流す**。発散がゼロなので粒子が一点に吸い込まれたり
   穴が空いたりせず、大理石のような渦になる。
 - **文字は粒子にしない**。原作の動画を見ると、左下のアーティスト名・曲名は普通の文字の重ね描き。
+- **音への反応**（avj_aud_*）: 低域＝流す時間を増やし全体を少しふくらませる／中域＝流れの形が
+  変わる速さ（Speed CHOP で積分した時刻 avj_ftime）／高域＝明るさ（avj_glow）。各帯域は
+  「直近 AGC_SEC 秒の平均の2倍＋下駄」で割る自動ゲインで 0〜1.5 にそろえる（曲ごとの音量差を吸収）。
 - **他のノードには触らない**。/project1 に avj_* を足すだけなので、他の .tox と同じプロジェクトに同居できる。
 
 使い方
@@ -43,7 +46,9 @@ Serato の履歴セッションを読む serato_nowplaying.py（TD の外で動�
 1. TD の外で  uv run scripts/serato_nowplaying.py  を起動しておく（Serato 無しで試すなら
    --track <曲ファイル> で1回書き出す）
 2. このスクリプトを実行し、/project1/avj_out を表示する
-3. 曲の切り替え（nowplaying.json の seq が変わる）で集合からやり直す。
+3. 音は avj_aud_in のデバイスを DJ ミキサーの出力が入る入力に合わせる。ビルド前に
+   os.environ['AVJ_AUDIO_FILE'] に曲ファイルを入れると、その曲を解析する（検証・リハーサル用）
+4. 曲の切り替え（nowplaying.json の seq が変わる）で集合からやり直す。
    手動で再生するなら  op('avj_ctrl').module.retrigger()
 """
 
@@ -77,6 +82,24 @@ NOISE_SCALE = 1.6           # 渦の大きさ（大きいほど細かい渦）
 SCATTER = 1.8               # 集合開始時に粒子が散らばっている半径
 SPREAD = (1.9, 1.0)         # 渦の段階で格子を横・縦に何倍へ広げるか（原作は横長に広がる）
 
+# --- 音反応 ---
+# 入力: 既定はオーディオ入力デバイス（DJ ミキサーの出力を繋いだインターフェース等）。
+# 環境変数 AVJ_AUDIO_FILE に曲ファイルを渡すと、そのファイルを解析する（スピーカーからは鳴らない。
+# リハーサルと検証用）。
+AUDIO_FILE = os.environ.get('AVJ_AUDIO_FILE', '')
+# 自動ゲイン: 各帯域を「その帯域の直近 AGC_SEC 秒の平均の2倍」で割って 0〜1 程度にそろえる
+# （1.5 で頭打ち）。固定の基準値で割ると、曲ごとの音量差で反応がまるで変わった。実曲 40 秒の
+# 低域 p95 が Roy Ayers「Wave」0.060 / ATCQ「Electric Relaxation」0.367 / house 0.300 と6倍違い、
+# 静かな曲はほぼ動かなかった。平均で割れば、曲の中で「いつもより強い音」に反応する。
+AGC_SEC = 6.0
+# 平均がこれより小さい（ほぼ無音）ときの下駄。無音で小さなノイズを 1.5 まで増幅しないため。
+# 3曲の p50 の 1/4〜1/2 程度
+BAND_FLOOR = {'low': 0.01, 'mid': 0.01, 'high': 0.003}
+KICK_FLOW = 0.35            # 低域: 流す時間を +35%（最大 +52%）。キックで渦が深く折り畳まれる。0.8 だと布が裂けて糸になった
+KICK_PULSE = 0.04           # 低域: 全体を最大 +4% ふくらませる（静止中のジャケットも脈打つ）
+MID_SPEED = 1.5             # 中域: 渦の形が変わる速さを最大 +150%
+HIGH_GLOW = 0.3             # 高域: 明るさを +30%（1.5 で頭打ちなので最大 +45%）。0.6 ではジャケットが白っぽく飛んだ
+
 X0, Y0 = 0, 900             # ネットワーク上の配置（既存ノードの下）
 
 GLSL_SRC = r'''
@@ -86,6 +109,9 @@ uniform float uT0;
 uniform vec4 uPhase;   // gather, hold, ramp, flow time
 uniform vec4 uShape;   // half, noise scale, scatter, -
 uniform vec4 uFlow;    // -, spread x, spread y, -
+uniform float uFTime;  // 流れの形の時刻（中域で速まる。avj_ftime が積分）
+uniform vec4 uAudio;   // low, mid, high（0〜1.5 に正規化済み）, -
+uniform vec4 uGain;    // kick flow, kick pulse, -, -
 #define STEPS 24
 out vec4 fragColor;
 
@@ -136,7 +162,7 @@ vec2 hash22(vec2 p){
 
 void main(){
   vec2 uv = vUV.st;
-  vec2 grid = (uv*2.0 - 1.0) * uShape.x;
+  vec2 grid = (uv*2.0 - 1.0) * uShape.x * (1.0 + uAudio.x * uGain.y);   // キックで脈打つ
   float age = uTime - uT0;
   vec2 pos;
   if (age < uPhase.x) {
@@ -155,8 +181,8 @@ void main(){
     // 前フレームを積分し続ける方式は、渦に引き伸ばされて糸状にやせ、画面が穴だらけになった
     float a = smoothstep(0.0, uPhase.z, age - uPhase.x - uPhase.y);
     vec2 p = grid * mix(vec2(1.0), uFlow.yz, a);
-    float h = uPhase.w * a / float(STEPS);
-    for (int i = 0; i < STEPS; i++) p += curl(p, uTime) * h;
+    float h = uPhase.w * a * (1.0 + uAudio.x * uGain.x) / float(STEPS);  // キックで深く
+    for (int i = 0; i < STEPS; i++) p += curl(p, uFTime) * h;
     pos = p;
   }
   fragColor = TDOutputSwizzle(vec4(pos, 0.0, 1.0));
@@ -210,14 +236,101 @@ def onFrameStart(frame):
 '''
 
 
+def _is_expr(v):
+    return isinstance(v, tuple) and len(v) == 2 and v[0] == 'expr'
+
+
 def _vec(g, i, name, val):
-    """GLSL TOP の Vectors ページ i 番目に uniform を設定。val は (x,y,z,w) か ('expr', 式)。"""
+    """GLSL TOP の Vectors ページ i 番目に uniform を設定。
+    val は ('expr', 式)（x だけ）か、成分ごとに 数値 / ('expr', 式) を並べたタプル。"""
     setattr(g.par, f'vec{i}name', name)
-    if isinstance(val, tuple) and val and val[0] == 'expr':
-        getattr(g.par, f'vec{i}valuex').expr = val[1]
-        return
+    if _is_expr(val):
+        val = (val,)
     for c, v in zip('xyzw', val):
-        getattr(g.par, f'vec{i}value{c}').val = v
+        par = getattr(g.par, f'vec{i}value{c}')
+        if _is_expr(v):
+            par.expr = v[1]
+        else:
+            par.val = v
+
+
+def _ch(node, ch):
+    """node の ch を読む式。node やチャンネルが無ければ 0（1つ欠けただけで uniform 全体が
+    tdError になり、粒子が止まるのを防ぐ）。"""
+    return (f"(op('{node}')['{ch}'] if op('{node}') is not None "
+            f"and op('{node}')['{ch}'] is not None else 0)")
+
+
+def _band(ch):
+    """帯域 ch を自動ゲインで 0〜1.5 にした式（今の値 ÷ (直近平均×2 + 下駄)）。"""
+    return (f"min(1.5, max(0, {_ch('avj_aud', ch)} / "
+            f"(2 * {_ch('avj_aud_slow', ch)} + {BAND_FLOOR[ch]})))")
+
+
+# 音の解析チェーン（td-organic-patterns の build_audio_reactive.py と同じ帯域分割）。
+# 🚨 Audio Spectrum の frequencylog は 0（線形。サンプル番号 ≒ Hz）、Trim は relative='abs'。
+#    既定のままだと低中高がほぼ同じ値になる（organic-patterns で実機確認済みの罠）。
+AUDIO_NODES = {
+    # ステレオを1本に（各帯域の Rename が1チャンネル目しか 'low' 等にしないため。
+    # mp3 を入れたら low と chan2 が別々に出た）
+    'avj_aud_mono': dict(type='mathCHOP', x=X0 - 800, y=Y0 - 520, pars={'chanop': 'avg'}),
+    'avj_aud_spec': dict(type='audiospectrumCHOP', x=X0 - 800, y=Y0 - 600, pars={'frequencylog': 0}),
+    'avj_band_low': dict(type='trimCHOP', x=X0 - 640, y=Y0 - 520, pars={
+        'relative': 'abs', 'start': 2, 'end': 120}),
+    'avj_band_mid': dict(type='trimCHOP', x=X0 - 640, y=Y0 - 600, pars={
+        'relative': 'abs', 'start': 120, 'end': 900}),
+    'avj_band_high': dict(type='trimCHOP', x=X0 - 640, y=Y0 - 680, pars={
+        'relative': 'abs', 'start': 900, 'end': 4000}),
+    'avj_an_low': dict(type='analyzeCHOP', x=X0 - 480, y=Y0 - 520, pars={'function': 'average'}),
+    'avj_an_mid': dict(type='analyzeCHOP', x=X0 - 480, y=Y0 - 600, pars={'function': 'average'}),
+    'avj_an_high': dict(type='analyzeCHOP', x=X0 - 480, y=Y0 - 680, pars={'function': 'average'}),
+    'avj_ren_low': dict(type='renameCHOP', x=X0 - 320, y=Y0 - 520, pars={'renamefrom': '*', 'renameto': 'low'}),
+    'avj_ren_mid': dict(type='renameCHOP', x=X0 - 320, y=Y0 - 600, pars={'renamefrom': '*', 'renameto': 'mid'}),
+    'avj_ren_high': dict(type='renameCHOP', x=X0 - 320, y=Y0 - 680, pars={'renamefrom': '*', 'renameto': 'high'}),
+    'avj_aud_merge': dict(type='mergeCHOP', x=X0 - 160, y=Y0 - 600, pars={}),
+    # NaN を 0 に。曲ファイルを差し替えた瞬間に NaN が1回混ざり、それを Lag が抱え込んで
+    # 以後ずっと NaN を出し続けた（実機で確認）。Lag の手前で消す
+    'avj_aud_clean': dict(type='expressionCHOP', x=X0 - 80, y=Y0 - 680, pars={
+        'expr0expr': ('expr', "me.inputVal if me.inputVal == me.inputVal and abs(me.inputVal) < 1e6 else 0")}),
+    # FFT はフレームごとに激しく揺れるので、立ち上がり速く（0.02秒）余韻を残して（0.15秒）ならす
+    'avj_aud_lag': dict(type='lagCHOP', x=X0, y=Y0 - 600, pars={'lag1': 0.02, 'lag2': 0.15}),
+    'avj_aud': dict(type='nullCHOP', x=X0 + 160, y=Y0 - 600, pars={}),
+    # 自動ゲインの分母: 直近 AGC_SEC 秒の平均的な大きさ
+    'avj_aud_slow': dict(type='lagCHOP', x=X0 + 160, y=Y0 - 760, pars={'lag1': AGC_SEC, 'lag2': AGC_SEC}),
+    # 流れの形の時刻: 速さ(1 + 中域) を Speed CHOP で積分する。absTime に係数を掛けると、
+    # 係数が変わった瞬間に時刻そのものが飛んで渦がワープする
+    'avj_ftime_rate': dict(type='constantCHOP', x=X0 + 160, y=Y0 - 440, pars={
+        'name0': 't', 'value0': ('expr', f"1 + {MID_SPEED} * {_band('mid')}")}),
+    'avj_ftime': dict(type='speedCHOP', x=X0 + 320, y=Y0 - 440, pars={}),
+}
+AUDIO_WIRES = {
+    'avj_aud_spec': [(0, 'avj_aud_mono')],
+    'avj_band_low': [(0, 'avj_aud_spec')], 'avj_band_mid': [(0, 'avj_aud_spec')],
+    'avj_band_high': [(0, 'avj_aud_spec')],
+    'avj_an_low': [(0, 'avj_band_low')], 'avj_an_mid': [(0, 'avj_band_mid')],
+    'avj_an_high': [(0, 'avj_band_high')],
+    'avj_ren_low': [(0, 'avj_an_low')], 'avj_ren_mid': [(0, 'avj_an_mid')],
+    'avj_ren_high': [(0, 'avj_an_high')],
+    'avj_aud_merge': [(0, 'avj_ren_low'), (1, 'avj_ren_mid'), (2, 'avj_ren_high')],
+    'avj_aud_clean': [(0, 'avj_aud_merge')],
+    'avj_aud_lag': [(0, 'avj_aud_clean')],
+    'avj_aud': [(0, 'avj_aud_lag')],
+    'avj_aud_slow': [(0, 'avj_aud_clean')],
+    'avj_ftime': [(0, 'avj_ftime_rate')],
+}
+
+
+def build_audio(p):
+    """音の入力（デバイス or ファイル）→ 帯域 → avj_aud を作る。"""
+    tdb.destroy(p, 'avj_aud_in')
+    if AUDIO_FILE:
+        src = tdb.ensure(p, 'avj_aud_in', 'audiofileinCHOP', X0 - 960, Y0 - 600,
+                         pars={'file': AUDIO_FILE, 'play': True, 'repeat': 'on'})
+    else:
+        src = tdb.ensure(p, 'avj_aud_in', 'audiodeviceinCHOP', X0 - 960, Y0 - 600)
+    made = tdb.build_nodes(p, AUDIO_NODES, AUDIO_WIRES)
+    made['avj_aud_mono'].inputConnectors[0].connect(src)
+    return made
 
 
 def build():
@@ -261,6 +374,9 @@ def build():
         # 文字は集合が終わる頃にフェードイン
         'avj_text_lv': dict(type='levelTOP', x=X0 + 960, y=Y0 + 240, pars={
             'opacity': ('expr', f"min(1, max(0, (absTime.seconds - op('avj_state')['t0'] - {GATHER * 0.8}) / 1.2))")}),
+        # 高域で明るく（ハイハットで粒がきらめく）
+        'avj_glow': dict(type='levelTOP', x=X0 + 960, y=Y0 - 160, pars={
+            'brightness1': ('expr', f"1 + {HIGH_GLOW} * {_band('high')}")}),
         'avj_bg': dict(type='constantTOP', x=X0 + 960, y=Y0 - 320, res=OUT_RES, pars={
             'colorr': 0, 'colorg': 0, 'colorb': 0, 'alpha': 1}),
         'avj_comp': dict(type='compositeTOP', x=X0 + 1120, y=Y0 - 160, res=OUT_RES, pars={'operand': 'over'}),
@@ -270,20 +386,25 @@ def build():
         'avj_art_sq': [(0, 'avj_art')],
         'avj_text': [(0, 'avj_artist'), (1, 'avj_title')],
         'avj_text_lv': [(0, 'avj_text')],
-        'avj_comp': [(0, 'avj_text_lv'), (1, 'avj_render'), (2, 'avj_bg')],
+        'avj_glow': [(0, 'avj_render')],
+        'avj_comp': [(0, 'avj_text_lv'), (1, 'avj_glow'), (2, 'avj_bg')],
         'avj_out': [(0, 'avj_comp')],
     }
     tdb.destroy(p, 'avj_ctrl', 'avj_init', 'avj_fb')
+    build_audio(p)                               # uniform の式が読む avj_aud / avj_ftime を先に作る
     made = tdb.build_nodes(p, nodes, wires)
 
     made['avj_pos_glsl'].text = GLSL_SRC
     g = made['avj_pos']
-    g.seq.vec.numBlocks = 5
+    g.seq.vec.numBlocks = 8
     _vec(g, 0, 'uTime', ('expr', 'absTime.seconds'))
     _vec(g, 1, 'uT0', ('expr', "op('avj_state')['t0']"))
     _vec(g, 2, 'uPhase', (GATHER, HOLD, RAMP, FLOW_T))
     _vec(g, 3, 'uShape', (HALF, NOISE_SCALE, SCATTER, 0.0))
     _vec(g, 4, 'uFlow', (0.0, SPREAD[0], SPREAD[1], 0.0))
+    _vec(g, 5, 'uFTime', ('expr', "op('avj_ftime')['t'] if op('avj_ftime') is not None else absTime.seconds"))
+    _vec(g, 6, 'uAudio', (('expr', _band('low')), ('expr', _band('mid')), ('expr', _band('high')), 0.0))
+    _vec(g, 7, 'uGain', (KICK_FLOW, KICK_PULSE, 0.0, 0.0))
 
     # Geometry COMP の中身: 既定の torus を消して、粒子1個ぶんの小さな四角を1枚
     geo = made['avj_geo']
