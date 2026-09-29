@@ -1,0 +1,15 @@
+# TouchDesigner
+*.toe
+*.toebak
+Backup/
+*.dir/
+
+# OS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# 曲情報とジャケット（他者の著作物）の書き出し先
+nowplaying/
