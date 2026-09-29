@@ -45,6 +45,17 @@ build_artwork_vj.py（TD 内に /project1/avj_* を作る）
    （Textport に貼る場合、スクリプトの場所は環境変数 `TD_ARTWORK_VJ_SCRIPTS` か、スクリプト冒頭の既定パスで探す）
 3. `/project1/avj_out`（1920×1080）を表示する。手動でやり直すなら `op('/project1/avj_ctrl').module.retrigger()`
 
+### .tox を読み込む場合
+
+[tox/artwork_vj.tox](tox/artwork_vj.tox) をネットワークにドラッグすると、`avj_*` 一式と
+出力 `out1` を持つ Container COMP ができる（ビルドスクリプトと同じ中身。曲情報は空の状態で
+書き出してあり、`nowplaying/nowplaying.json` があれば読み込んだ直後に反映される）。
+ただし `avj_ctrl` が見る `nowplaying.json` のパスは書き出した環境の絶対パスなので、別の場所に
+置いた場合は `avj_ctrl` の `NOWPLAYING` を書き換えるか、ビルドスクリプトを使う。
+
+> TouchDesigner の Non-Commercial 版は解像度の上限が 1280×1280 なので、1920×1080 を指定しても
+> 出力は 1280×720 になる（実機で確認）。
+
 曲が変わるたびに次の順で進む（秒数は `build_artwork_vj.py` 冒頭の定数）。
 
 | 段階 | 時間 | 見た目 |
