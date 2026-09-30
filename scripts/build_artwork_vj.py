@@ -9,7 +9,7 @@ Serato の履歴セッションを読む serato_nowplaying.py（TD の外で動�
   serato_nowplaying.py ─→ nowplaying/nowplaying.json ＋ artwork_<n>.jpg
                                    │ avj_ctrl（Execute DAT）が 0.25 秒ごとに見る
                                    ▼
-  avj_art(Movie File In) ─ avj_art_sq(N×N) ────────────┐ 粒子の色（インスタンスカラー）
+  avj_art_a / avj_art_b(2デッキ) ─ avj_art_sq(Cross・N×N) ─┐ 粒子の色（インスタンスカラー）
   avj_state(t0, seq) ─→ avj_pos(GLSL・32bit float・N×N)──┤ 粒子の位置（インスタンス tx/ty）
                                                        avj_geo(点×N²) ─ avj_render ─┐
   avj_artist / avj_title(Text TOP) ─ avj_text ─ avj_text_lv(フェード) ─────────────── avj_comp ─ avj_out
@@ -17,8 +17,10 @@ Serato の履歴セッションを読む serato_nowplaying.py（TD の外で動�
 
 曲が変わってからの経過時間 age で3段階に分ける（全部 GLSL の中で age から決まる）
 --------------------------------------------------------------------------------
-  0 〜 GATHER           散らばった粒子がジャケットの格子位置へ集まる（位置は age の式で決まる）
-  GATHER 〜 +HOLD       ジャケットの形のまま静止（位置 = 格子）
+  0 〜 GATHER / MIX     最初の曲: 散らばった粒子がジャケットの格子位置へ集まる
+                        2曲目以降（ミックス）: 前の曲の渦を「崩れ具合 a を 0 へ戻す」ことでほどき、
+                        そのまま次のジャケットの形に組み替える。色は2デッキのクロスフェードで移る
+  〜 +HOLD              ジャケットの形のまま静止（位置 = 格子）
   それ以降              横に広げた格子から curl noise の流れに沿って FLOW_T だけ流した先に置く。
                         毎フレーム格子からやり直す（前フレームを積分しない）。流す量は RAMP 秒
                         かけて 0→1 に上げ、静止からじわっと崩れ始める。流れの形が時間で変わるので渦は動き続ける
@@ -74,7 +76,8 @@ ORTHO_H = 2.0               # 正射影カメラの縦の幅（画面の縦 = 2 
 HALF = 0.5                  # ジャケットの半辺（縦 2 単位のうち 1 単位 = 画面の縦の半分）
 DOT = 0.0034                # 粒子1個の四角の辺（1080px で約 1.8px）
 
-GATHER = 2.5                # 集合にかける秒数
+GATHER = 2.5                # 最初の曲: 散らばった粒子が集まるまでの秒数
+MIX = 4.0                   # 2曲目以降: 前の曲の渦がほどけて次のジャケットに組み替わるまでの秒数
 HOLD = 3.0                  # ジャケットの形で静止する秒数
 RAMP = 6.0                  # 流れの強さを 0→1 に上げる秒数
 FLOW_T = 0.08               # 流す時間（大きいほど深く折り畳まれる）
@@ -106,12 +109,13 @@ GLSL_SRC = r'''
 // 粒子の位置テクスチャ（r,g = x,y）。入力なし。曲の切替からの経過時間だけで位置が決まる
 uniform float uTime;
 uniform float uT0;
-uniform vec4 uPhase;   // gather, hold, ramp, flow time
+uniform vec4 uPhase;   // (未使用。集合秒数は uMix.z), hold, ramp, flow time
 uniform vec4 uShape;   // half, noise scale, scatter, -
 uniform vec4 uFlow;    // -, spread x, spread y, -
 uniform float uFTime;  // 流れの形の時刻（中域で速まる。avj_ftime が積分）
 uniform vec4 uAudio;   // low, mid, high（0〜1.5 に正規化済み）, -
 uniform vec4 uGain;    // kick flow, kick pulse, -, -
+uniform vec4 uMix;     // 前の曲の t0, 前の曲があるか(0/1), 今の集合秒数, 前の曲の集合秒数
 #define STEPS 24
 out vec4 fragColor;
 
@@ -160,30 +164,40 @@ vec2 hash22(vec2 p){
   return fract(vec2(a.x*a.y, a.y*a.z));
 }
 
+// 渦: 「横に広げた格子」から、今の流れに沿って有限時間 T だけ流した先に置く。
+// a（0〜1）が崩れ具合。a=0 なら格子そのもの。毎フレーム格子からやり直すので、粒子は隣どうしの
+// まま布を折り畳んだように曲がる（前フレームを積分し続ける方式は、糸状にやせて穴だらけになった）
+vec2 swirl(vec2 grid, float a){
+  vec2 p = grid * mix(vec2(1.0), uFlow.yz, a);
+  float h = uPhase.w * a * (1.0 + uAudio.x * uGain.x) / float(STEPS);  // キックで深く
+  for (int i = 0; i < STEPS; i++) p += curl(p, uFTime) * h;
+  return p;
+}
+
 void main(){
   vec2 uv = vUV.st;
   vec2 grid = (uv*2.0 - 1.0) * uShape.x * (1.0 + uAudio.x * uGain.y);   // キックで脈打つ
   float age = uTime - uT0;
+  float gd = uMix.z;                             // 今の曲の集合にかける秒数（GATHER か MIX）
   vec2 pos;
-  if (age < uPhase.x) {
-    // 集合: 散らばった位置 → 格子。age の式だけで決まる（前フレームを読まない）
-    vec2 h = hash22(uv*997.0);
-    float ang = h.x * 6.2831853;
-    vec2 start = grid + vec2(cos(ang), sin(ang)) * uShape.z * (0.3 + 0.7*h.y);
-    float k = clamp(age / uPhase.x, 0.0, 1.0);
-    k = 1.0 - pow(1.0 - k, 3.0);                 // 最後にふわっと止まる
-    pos = mix(start, grid, k);
-  } else if (age < uPhase.x + uPhase.y) {
+  if (age < gd) {
+    float k = clamp(age / gd, 0.0, 1.0);
+    if (uMix.y > 0.5) {
+      // ミックス: 前の曲の渦を、崩れ具合 a を 0 へ戻すことで「ほどいて」格子へ組み替える。
+      // 切替の瞬間は前の曲の渦と同じ式・同じ値なので、位置が1フレームも飛ばない
+      float aOld = smoothstep(0.0, uPhase.z, (uT0 - uMix.x) - uMix.w - uPhase.y);
+      pos = swirl(grid, aOld * (1.0 - smoothstep(0.0, 1.0, k)));
+    } else {
+      // 最初の曲: 散らばった位置 → 格子
+      vec2 h = hash22(uv*997.0);
+      float ang = h.x * 6.2831853;
+      vec2 start = grid + vec2(cos(ang), sin(ang)) * uShape.z * (0.3 + 0.7*h.y);
+      pos = mix(start, grid, 1.0 - pow(1.0 - k, 3.0));   // 最後にふわっと止まる
+    }
+  } else if (age < gd + uPhase.y) {
     pos = grid;                                  // 静止
   } else {
-    // 渦: 「横に広げた格子」から、今の流れに沿って有限時間 T だけ流した先に置く。
-    // 毎フレーム格子からやり直すので、粒子は隣どうしのまま布を折り畳んだように曲がる。
-    // 前フレームを積分し続ける方式は、渦に引き伸ばされて糸状にやせ、画面が穴だらけになった
-    float a = smoothstep(0.0, uPhase.z, age - uPhase.x - uPhase.y);
-    vec2 p = grid * mix(vec2(1.0), uFlow.yz, a);
-    float h = uPhase.w * a * (1.0 + uAudio.x * uGain.x) / float(STEPS);  // キックで深く
-    for (int i = 0; i < STEPS; i++) p += curl(p, uFTime) * h;
-    pos = p;
+    pos = swirl(grid, smoothstep(0.0, uPhase.z, age - gd - uPhase.y));
   }
   fragColor = TDOutputSwizzle(vec4(pos, 0.0, 1.0));
 }
@@ -196,22 +210,44 @@ CTRL_SRC = r'''
 import json, os
 
 NOWPLAYING = %r
+GATHER = %r
+MIX = %r
+DECKS = ('avj_art_a', 'avj_art_b')          # ジャケットの2デッキ（DJ の A/B と同じく交互に使う）
 
+# avj_state のチャンネル: 0 t0 / 1 seq / 2 t0prev / 3 hasprev / 4 gdur / 5 gdurprev / 6 deck / 7 prevdeck
 def _st():
     return op('avj_state')
 
+def _start(deck, has_prev):
+    """切替を始める。前の曲の t0・集合秒数・デッキを prev 側へずらしてから、t0 を今にする。"""
+    s = _st().par
+    s.value2 = s.value0.eval()
+    s.value5 = s.value4.eval()
+    s.value3 = 1 if has_prev else 0
+    s.value4 = MIX if has_prev else GATHER
+    # 前の曲が無ければ色もフェードしない（空いたデッキには TD 既定の画像が入っていて、
+    # 最初の曲がそこから色を移してしまった）
+    s.value7 = s.value6.eval() if has_prev else deck
+    s.value6 = deck
+    s.value0 = absTime.seconds
+
 def retrigger():
-    """集合からやり直す（手動再生・テスト用）"""
-    _st().par.value0 = absTime.seconds
+    """今の曲をもう一度（自分の渦をほどいて自分のジャケットへ）。手動再生・テスト用"""
+    _start(int(_st().par.value6), has_prev=True)
 
 def _apply(d):
+    s = _st().par
+    cur = int(s.value6)
+    new = 1 - cur                                # 空いている側のデッキに載せる
     art = d.get('art')
-    if art and os.path.exists(art):
-        op('avj_art').par.file = art
+    if not (art and os.path.exists(art)):
+        art = op(DECKS[cur]).par.file.eval()     # ジャケットが無い曲は前の絵のまま
+    op(DECKS[new]).par.file = art
     op('avj_artist').par.text = (d.get('artist') or '').upper()
     op('avj_title').par.text = d.get('title') or ''
-    _st().par.value1 = d.get('seq', 0)
-    retrigger()
+    has_prev = int(s.value1) > 0                 # 前に表示していた曲があればミックス
+    s.value1 = d.get('seq', 0)
+    _start(new, has_prev)
 
 def poll():
     try:
@@ -340,9 +376,19 @@ def build():
     nodes = {
         # 曲の状態: value0 = t0（切替時刻・秒）, value1 = seq
         'avj_state': dict(type='constantCHOP', x=X0, y=Y0 + 160, pars={
-            'name0': 't0', 'value0': td.absTime.seconds, 'name1': 'seq', 'value1': 0}),
-        'avj_art': dict(type='moviefileinTOP', x=X0, y=Y0, pars={}),
-        'avj_art_sq': dict(type='fitTOP', x=X0 + 160, y=Y0, res=(N, N), pars={'fit': 'fitoutside'}),
+            'name0': 't0', 'value0': td.absTime.seconds, 'name1': 'seq', 'value1': 0,
+            'name2': 't0prev', 'value2': 0, 'name3': 'hasprev', 'value3': 0,
+            'name4': 'gdur', 'value4': GATHER, 'name5': 'gdurprev', 'value5': GATHER,
+            'name6': 'deck', 'value6': 0, 'name7': 'prevdeck', 'value7': 0}),
+        # ジャケットの2デッキ。新しい曲は空いている側に載せ、avj_art_sq で前の曲から
+        # 集合の秒数をかけてクロスフェードする（粒子の色が前の曲の色から次の曲の色へ移る）
+        'avj_art_a': dict(type='moviefileinTOP', x=X0 - 160, y=Y0 + 60, pars={}),
+        'avj_art_b': dict(type='moviefileinTOP', x=X0 - 160, y=Y0 - 60, pars={}),
+        'avj_fit_a': dict(type='fitTOP', x=X0, y=Y0 + 60, res=(N, N), pars={'fit': 'fitoutside'}),
+        'avj_fit_b': dict(type='fitTOP', x=X0, y=Y0 - 60, res=(N, N), pars={'fit': 'fitoutside'}),
+        'avj_art_sq': dict(type='crossTOP', x=X0 + 160, y=Y0, res=(N, N), pars={
+            'cross': ('expr', "op('avj_state')['prevdeck'] + (op('avj_state')['deck'] - op('avj_state')['prevdeck'])"
+                              " * min(1, max(0, (absTime.seconds - op('avj_state')['t0']) / max(0.01, op('avj_state')['gdur'])))")}),
         'avj_pos_glsl': dict(type='textDAT', x=X0 + 320, y=Y0 - 320, pars={}),
         'avj_pos': dict(type='glslTOP', x=X0 + 320, y=Y0 - 160, res=(N, N), pars={
             'pixeldat': 'avj_pos_glsl', 'format': 'rgba32float', 'inputfiltertype': 'nearest',
@@ -373,7 +419,7 @@ def build():
         'avj_text': dict(type='compositeTOP', x=X0 + 800, y=Y0 + 240, res=OUT_RES, pars={'operand': 'over'}),
         # 文字は集合が終わる頃にフェードイン
         'avj_text_lv': dict(type='levelTOP', x=X0 + 960, y=Y0 + 240, pars={
-            'opacity': ('expr', f"min(1, max(0, (absTime.seconds - op('avj_state')['t0'] - {GATHER * 0.8}) / 1.2))")}),
+            'opacity': ('expr', "min(1, max(0, (absTime.seconds - op('avj_state')['t0'] - op('avj_state')['gdur'] * 0.8) / 1.2))")}),
         # 高域で明るく（ハイハットで粒がきらめく）
         'avj_glow': dict(type='levelTOP', x=X0 + 960, y=Y0 - 160, pars={
             'brightness1': ('expr', f"1 + {HIGH_GLOW} * {_band('high')}")}),
@@ -383,20 +429,22 @@ def build():
         'avj_out': dict(type='nullTOP', x=X0 + 1280, y=Y0 - 160, pars={}),
     }
     wires = {
-        'avj_art_sq': [(0, 'avj_art')],
+        'avj_fit_a': [(0, 'avj_art_a')],
+        'avj_fit_b': [(0, 'avj_art_b')],
+        'avj_art_sq': [(0, 'avj_fit_a'), (1, 'avj_fit_b')],
         'avj_text': [(0, 'avj_artist'), (1, 'avj_title')],
         'avj_text_lv': [(0, 'avj_text')],
         'avj_glow': [(0, 'avj_render')],
         'avj_comp': [(0, 'avj_text_lv'), (1, 'avj_glow'), (2, 'avj_bg')],
         'avj_out': [(0, 'avj_comp')],
     }
-    tdb.destroy(p, 'avj_ctrl', 'avj_init', 'avj_fb')
+    tdb.destroy(p, 'avj_ctrl', 'avj_init', 'avj_fb', 'avj_art')
     build_audio(p)                               # uniform の式が読む avj_aud / avj_ftime を先に作る
     made = tdb.build_nodes(p, nodes, wires)
 
     made['avj_pos_glsl'].text = GLSL_SRC
     g = made['avj_pos']
-    g.seq.vec.numBlocks = 8
+    g.seq.vec.numBlocks = 9
     _vec(g, 0, 'uTime', ('expr', 'absTime.seconds'))
     _vec(g, 1, 'uT0', ('expr', "op('avj_state')['t0']"))
     _vec(g, 2, 'uPhase', (GATHER, HOLD, RAMP, FLOW_T))
@@ -405,6 +453,8 @@ def build():
     _vec(g, 5, 'uFTime', ('expr', "op('avj_ftime')['t'] if op('avj_ftime') is not None else absTime.seconds"))
     _vec(g, 6, 'uAudio', (('expr', _band('low')), ('expr', _band('mid')), ('expr', _band('high')), 0.0))
     _vec(g, 7, 'uGain', (KICK_FLOW, KICK_PULSE, 0.0, 0.0))
+    _st = lambda c: ('expr', f"op('avj_state')['{c}']")
+    _vec(g, 8, 'uMix', (_st('t0prev'), _st('hasprev'), _st('gdur'), _st('gdurprev')))
 
     # Geometry COMP の中身: 既定の torus を消して、粒子1個ぶんの小さな四角を1枚
     geo = made['avj_geo']
@@ -416,7 +466,7 @@ def build():
     dot.display = True
 
     tdb.ensure(p, 'avj_ctrl', 'executeDAT', X0 + 1280, Y0 + 160,
-               text=CTRL_SRC % NOWPLAYING,
+               text=CTRL_SRC % (NOWPLAYING, GATHER, MIX),
                pars={'framestart': True, 'active': True})
     op_ctrl = p.op('avj_ctrl')
     op_ctrl.module.poll()                        # 既に nowplaying.json があれば即反映
